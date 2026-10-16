@@ -150,6 +150,14 @@ def _sanitize(name):
     return re.sub(r"[^a-z0-9-]", "", name.lower().replace(" ", "-"))
 
 
-if __name__ == "__main__":
+def main():
+    """Bind the dashboard. Local-first: loopback by default, HOST overrides."""
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    host = os.getenv("HOST", "127.0.0.1")
+    if not DASH_TOKEN and host != "127.0.0.1":
+        sys.exit("refusing to bind a non-loopback address without DASH_TOKEN set")
+    uvicorn.run(app, host=host, port=PORT)
+
+
+if __name__ == "__main__":
+    main()
