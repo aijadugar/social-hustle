@@ -90,3 +90,61 @@ def test_api_runs_lists_run_without_memo(workdir, two_clients, monkeypatch):
     out = _json.loads(body) if isinstance(body, (bytes, bytearray)) else body
     assert out == [{"workflow_id": "brew-lane-20260101-0900",
                     "slug": "brew-lane", "status": "failed"}]
+
+
+# ---------------------------------------------------------------- auth
+def test_api_runs_unauthenticated_when_token_set(workdir, two_clients, monkeypatch):
+    """With DASH_TOKEN set, a request without the header is rejected with 401."""
+    runs = [FakeExec("brew-lane-20261016-0800", FakeDesc("RUNNING", {"client": "brew-lane"}))]
+    fc = FakeClient(runs)
+    monkeypatch.setattr(web, "client", lambda: asyncio.sleep(0, result=fc))
+    monkeypatch.setattr(web, "DASH_TOKEN", "secret")
+
+    async def call():
+        return await web.api_runs()
+
+    resp = asyncio.run(call())
+    body = resp.body if hasattr(resp, "body") else resp
+    import json as _json
+    out = _json.loads(body) if isinstance(body, (bytes, bytearray)) else body
+    assert out["status_code"] == 401
+
+
+def test_api_runs_authenticated_with_token(workdir, two_clients, monkeypatch):
+    """The right header passes the check and the run is listed."""
+    runs = [FakeExec("brew-lane-20261016-0800", FakeDesc("RUNNING", {"client": "brew-lane"}))]
+    fc = FakeClient(runs)
+    monkeypatch.setattr(web, "client", lambda: asyncio.sleep(0, result=fc))
+    monkeypatch.setattr(web, "DASH_TOKEN", "secret")
+
+    class Req:
+        headers = {"X-Dash-Token": "secret"}
+
+    async def call():
+        return await web.api_runs(Req())
+
+    resp = asyncio.run(call())
+    body = resp.body if hasattr(resp, "body") else resp
+    import json as _json
+    out = _json.loads(body) if isinstance(body, (bytes, bytearray)) else body
+    assert [r["workflow_id"] for r in out] == ["brew-lane-20261016-0800"]
+
+
+def test_api_runs_no_token_when_unset(workdir, two_clients, monkeypatch):
+    """No DASH_TOKEN -> auth disabled, everything passes through."""
+    runs = [FakeExec("brew-lane-20261016-0800", FakeDesc("RUNNING", {"client": "brew-lane"}))]
+    fc = FakeClient(runs)
+    monkeypatch.setattr(web, "client", lambda: asyncio.sleep(0, result=fc))
+    monkeypatch.setattr(web, "DASH_TOKEN", "")
+
+    class Req:
+        headers = {}
+
+    async def call():
+        return await web.api_runs(Req())
+
+    resp = asyncio.run(call())
+    body = resp.body if hasattr(resp, "body") else resp
+    import json as _json
+    out = _json.loads(body) if isinstance(body, (bytes, bytearray)) else body
+    assert [r["workflow_id"] for r in out] == ["brew-lane-20261016-0800"]
