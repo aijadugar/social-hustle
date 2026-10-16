@@ -86,7 +86,18 @@ def llm_json(prompt, schema):
     body = {"model": MODEL, "stream": False, "format": schema,
             "messages": [{"role": "user", "content": prompt}],
             "options": {"temperature": 0.7}}
-    return json.loads(json.loads(_req(OLLAMA, body))["message"]["content"])
+    raw = json.loads(_req(OLLAMA, body))["message"]["content"]
+    # Strip possible markdown code fences
+    stripped = raw.strip()
+    if stripped.startswith("```"):
+        # remove first line
+        lines = stripped.splitlines()
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        stripped = "\n".join(lines).strip()
+    return json.loads(stripped)
 
 
 # ---------- activities ----------
@@ -401,7 +412,7 @@ async def main():
     if cmd == "worker":
         print(f"Worker up (model={MODEL}). Ctrl+C to stop.")
         await Worker(client, task_queue=QUEUE, workflows=[ContentRun],
-                     activities=[research, analyze, draft, publish]).run()
+                     activities=[research, learn, analyze, draft, publish]).run()
     elif cmd == "run":
         brand = _load_brand(sys.argv[2])
         wid = f"{_slug(brand)}-{datetime.now():%Y%m%d-%H%M}"
