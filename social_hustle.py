@@ -22,9 +22,13 @@ Run:
   python social_hustle.py schedule                    # weekday 8am ContentRun per client
 Optional posting: export BSKY_HANDLE=you.bsky.social BSKY_APP_PASSWORD=xxxx
 """
-import asyncio, hashlib, json, os, sys, time, urllib.parse, urllib.request
+import asyncio, hashlib, json, logging, os, sys, time, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("social_hustle")
 
 from temporalio import activity, workflow
 from temporalio.client import Client, Schedule, ScheduleActionStartWorkflow, \
@@ -106,10 +110,24 @@ async def research(brand: dict) -> list[dict]:
     return await asyncio.to_thread(go)
 
 
+# How long to wait on the public Bluesky like-count lookups. Short: this is a
+# nice-to-have signal, never worth stalling the whole run.
+LEARN_NET_TIMEOUT = float(os.getenv("LEARN_NET_TIMEOUT", "5"))
+# A published post counts toward the "enough data" bar only if it actually went
+# out (or is a confirmed dry-run record). Pending entries don't count.
+MIN_POSTED = 5
+
+
 @activity.defn
 async def learn(brand: dict) -> dict:
     """What worked last week: read this client's history.jsonl plus the public
-    Bluesky like/repost counts for past posts, then ask Gemma for a summary."""
+    Bluesky like/repost counts for past posts, then ask Gemma for a summary.
+
+    Graceful: on any network error, empty history, or fewer than MIN_POSTED
+    published items, returns a null summary with a reason. The analyze/draft
+    prompts skip the "what worked" section when the summary is null, so a cold
+    start just means no performance signal — never a failed workflow.
+    """
     slug = brand.get("slug") or brand["name"].lower().replace(" ", "-")
     hist = os.path.join("clients", slug, "history.jsonl")
     posts = []
@@ -120,19 +138,19 @@ async def learn(brand: dict) -> dict:
                     posts.append(json.loads(line))
                 except Exception:
                     pass
-    posts = posts[-12:]
-    for p in posts:
+    posted = [p for p in posts if p.get("status") == "posted"]
+    if len(posted) < MIN_POSTED:
+        reason = (f"only {len(posted)} published post(s) on record "
+                  f"(need {MIN_POSTED})")
+        log.warning("learn[%s]: %s — skipping performance summary", slug, reason)
+        return {"summary": None, "reason": reason, "posts": posts}
+
+    for p in posted[-12:]:
         if p.get("result") and p["result"].startswith("at://"):
-            try:
-                j = json.loads(_get(
-                    f"https://bsky.social/xrpc/app.bsky.feed.getLikes?uri={p['result']}&limit=1"))
-                p["likes"] = j.get("likes", [{}])[0].get("count", 0) if j.get("likes") else 0
-            except Exception:
-                p["likes"] = 0
+            p["likes"] = await _bluesky_likes(p["result"])
         else:
-            p["likes"] = 0
-    if not posts:
-        return {"summary": "", "posts": []}
+            p["likes"] = 0  # dry-run record: no public engagement to read
+
     schema = {"type": "object", "properties": {"summary": {"type": "string"}},
               "required": ["summary"]}
     prompt = (f"Summarize what worked for {brand['name']} on social media from these "
@@ -141,9 +159,25 @@ async def learn(brand: dict) -> dict:
               f"styles got the most likes, and what to do more of / less of next week.\n\n"
               "Posts:\n" + "\n".join(
                   f"- {p.get('text','')[:200]} | likes: {p.get('likes', 0)}"
-                  for p in posts))
+                  for p in posted[-12:]))
     res = await asyncio.to_thread(llm_json, prompt, schema)
-    return {"summary": res["summary"], "posts": posts}
+    return {"summary": res["summary"], "reason": None, "posts": posted}
+
+
+async def _bluesky_likes(uri: str) -> int:
+    """Public like count for one post. One retry, short timeout, never raises —
+    this signal is optional and must not stall the run."""
+    url = f"https://bsky.social/xrpc/app.bsky.feed.getLikes?uri={uri}&limit=1"
+    for attempt in range(2):
+        try:
+            j = json.loads(await asyncio.to_thread(
+                _get, url, timeout=LEARN_NET_TIMEOUT))
+            likes = j.get("likes", [{}])[0].get("count", 0) if j.get("likes") else 0
+            return int(likes or 0)
+        except Exception as e:
+            log.warning("bluesky likes failed for %s (attempt %d): %s",
+                        uri, attempt + 1, e)
+    return 0
 
 
 @activity.defn
@@ -155,7 +189,7 @@ async def analyze(brand: dict, items: list[dict], learn: dict | None = None) -> 
         "required": ["title", "link", "why_it_fits", "score"]}}}, "required": ["picks"]}
     prompt = (f"You are a social media strategist for {brand['name']}: {brand['about']}\n"
               f"Audience: {brand['audience']}\n"
-              f"{('What worked last week: ' + learn['summary']) if learn and learn.get('summary') else ''}\n\n"
+              f"{_worked_section(learn)}\n\n"
               "Headlines this week:\n" +
               "\n".join(f"- {i['title']} | {i['link']}" for i in items) +
               "\n\nPick the 3 headlines this brand can comment on credibly and usefully. "
@@ -170,12 +204,14 @@ async def draft(brand: dict, picks: list[dict], learn: dict | None = None) -> li
     schema = {"type": "object", "properties": {"posts": {"type": "array", "items": {
         "type": "object", "properties": {"text": {"type": "string"}, "source": {"type": "string"}},
         "required": ["text", "source"]}}}, "required": ["posts"]}
+    mirror = ("Mirror the phrasing style and call-to-action format that worked "
+              "last week." if learn and learn.get("summary") else
+              "Mirror the brand's own voice and avoid format.")
     prompt = (f"Write one social post per topic for {brand['name']}.\n"
               f"Voice: {brand['voice']}\nNever: {brand.get('avoid', 'hype, emojis spam')}\n"
-              f"{('What worked last week: ' + learn['summary']) if learn and learn.get('summary') else ''}\n"
+              f"{_worked_section(learn)}\n"
               "Max 280 characters each. Add a clear point of view and a soft call to action. "
-              "Do not invent facts beyond the headline. Mirror the phrasing style and "
-              "call-to-action format that worked last week.\n\nTopics:\n" +
+              "Do not invent facts beyond the headline. " + mirror + "\n\nTopics:\n" +
               "\n".join(f"- {p['title']} ({p['why_it_fits']}) {p['link']}" for p in picks))
     res = await asyncio.to_thread(llm_json, prompt, schema)
     return [{"text": p["text"][:300], "source": p["source"]} for p in res["posts"]]
@@ -299,6 +335,19 @@ def _load_brand(path):
     return brand
 
 
+def _slug(brand: dict) -> str:
+    return brand.get("slug") or brand["name"].lower().replace(" ", "-")
+
+
+def _worked_section(learn: dict | None) -> str:
+    """The 'what worked last week' block for the analyze/draft prompts. Empty
+    when learn has no summary (cold start, not enough data, network failure),
+    so those prompts skip the section entirely instead of echoing a null."""
+    if learn and learn.get("summary"):
+        return f"What worked last week: {learn['summary']}"
+    return ""
+
+
 async def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     client = await Client.connect("localhost:7233")
@@ -308,8 +357,9 @@ async def main():
                      activities=[research, analyze, draft, publish]).run()
     elif cmd == "run":
         brand = _load_brand(sys.argv[2])
-        wid = f"{brand['name'].lower().replace(' ', '-')}-{datetime.now():%Y%m%d-%H%M}"
-        await client.start_workflow(ContentRun.run, brand, id=wid, task_queue=QUEUE)
+        wid = f"{_slug(brand)}-{datetime.now():%Y%m%d-%H%M}"
+        await client.start_workflow(ContentRun.run, brand, id=wid, task_queue=QUEUE,
+                                    memo={"client": _slug(brand)})
         print(f"Started {wid}\nNext: python social_hustle.py show {wid}")
     elif cmd == "show":
         h = client.get_workflow_handle(sys.argv[2])
@@ -327,7 +377,7 @@ async def main():
                 sid, Schedule(
                     action=ScheduleActionStartWorkflow(
                         ContentRun.run, brand, id=f"{slug}-{datetime.now():%Y%m%d}",
-                        task_queue=QUEUE),
+                        task_queue=QUEUE, memo={"client": slug}),
                     spec=ScheduleSpec(cron_expressions=["0 8 * * 1-5"]),
                     policy=type("P", (), {"overlap": ScheduleOverlapPolicy.SKIP})()),
             )

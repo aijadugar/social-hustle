@@ -76,7 +76,8 @@ async def api_run(slug: str):
     brand = sh._load_brand(p)
     c = await client()
     wid = f"{brand['name'].lower().replace(' ', '-')}-{datetime.now():%Y%m%d-%H%M}"
-    await c.start_workflow(sh.ContentRun.run, brand, id=wid, task_queue=sh.QUEUE)
+    await c.start_workflow(sh.ContentRun.run, brand, id=wid, task_queue=sh.QUEUE,
+                           memo={"client": sh._slug(brand)})
     return JSONResponse({"workflow_id": wid})
 
 
@@ -102,17 +103,32 @@ async def api_approve(wid: str, indexes: list[int]):
 
 @app.get("/api/runs")
 async def api_runs():
-    """Recent runs for the dashboard, newest first."""
+    """Recent runs for the dashboard, newest first.
+
+    The Temporal query is derived from the actual clients/*/ slugs, so any
+    client's runs show up (not just the ones hardcoded into the query). Each
+    run carries a `client` memo set at start; we read it back to tag the run
+    with the slug even if the workflow id was renamed later.
+    """
     c = await client()
+    slugs = [d for d in os.listdir("clients")
+             if os.path.isdir(os.path.join("clients", d))
+             and os.path.exists(os.path.join("clients", d, "brand.json"))]
     out = []
-    try:
-        async for w in c.list_workflows(
-                query=f"WorkflowId = 'brew-lane-*' OR WorkflowId = 'social-hustle-*'"):
-            d = await w.describe()
-            out.append({"workflow_id": w.id,
-                        "status": str(d.status).split(".")[-1].lower()})
-    except Exception:
-        pass
+    for slug in slugs:
+        try:
+            async for w in c.list_workflows(query=f"WorkflowId = '{slug}-*'"):
+                d = await w.describe()
+                try:
+                    run_slug = await w.memo_value("client", default=None)
+                except Exception:
+                    run_slug = None
+                out.append({"workflow_id": w.id,
+                            "slug": run_slug or slug,
+                            "status": str(d.status).split(".")[-1].lower()})
+        except Exception:
+            pass
+    out.sort(key=lambda r: r["workflow_id"], reverse=True)
     return JSONResponse(out)
 
 

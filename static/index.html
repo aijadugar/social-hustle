@@ -113,6 +113,8 @@ async function pollDrafts() {
     const ls = $('#learn-summary');
     if (learn && learn.summary) {
       ls.innerHTML = `<h3>What worked last week</h3><p>${esc(learn.summary)}</p>`;
+    } else if (learn && learn.reason) {
+      ls.innerHTML = `<h3>What worked last week</h3><p class="muted">Not enough data yet — ${esc(learn.reason)}.</p>`;
     } else {
       ls.innerHTML = '';
     }
