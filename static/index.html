@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Social Hustle</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>Social Hustle</h1>
+  <p class="sub">Done-for-you posts for your small business. Approve, then we publish.</p>
+</header>
+
+<main id="app">
+  <section id="client-list">
+    <h2>Your clients</h2>
+    <div id="clients"></div>
+  </section>
+</main>
+
+<template id="draft-template">
+  <article class="draft">
+    <div class="draft-head">
+      <span class="idx">0</span>
+      <span class="source"></span>
+    </div>
+    <textarea class="text" rows="3" spellcheck="true"></textarea>
+    <label class="check">
+      <input type="checkbox" class="tick">
+      <span>Approve this post</span>
+    </label>
+  </article>
+</template>
+
+<footer>
+  <p>Posts publish to Bluesky. No creds = dry-run to <code>outbox.jsonl</code>.</p>
+</footer>
+
+<script>
+const $ = (sel, el=document) => el.querySelector(sel);
+let active = null; // {slug, workflow_id}
+
+async function api(path, opts={}) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+  return r.json();
+}
+
+function esc(s){return (s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+
+async function loadClients() {
+  const clients = await api('/api/clients');
+  $('#clients').innerHTML = clients.map(c => `
+    <div class="client">
+      <div class="client-name">${esc(c.name)}</div>
+      <div class="client-audience">${esc(c.audience)}</div>
+      <button class="primary" data-slug="${c.slug}">Generate this week's posts</button>
+    </div>`).join('');
+  $('#clients').querySelectorAll('[data-slug]').forEach(b =>
+    b.addEventListener('click', () => startRun(b.dataset.slug)));
+}
+
+async function startRun(slug) {
+  const btn = document.querySelector(`[data-slug="${slug}"]`);
+  const old = btn.textContent;
+  btn.textContent = 'Working…';
+  btn.disabled = true;
+  try {
+    const {workflow_id} = await api(`/api/runs/${slug}`, {method:'POST'});
+    active = {slug, workflow_id};
+    renderRun();
+  } catch(e) {
+    btn.textContent = old; btn.disabled = false;
+    alert(e.message);
+  }
+}
+
+function renderRun() {
+  const section = $('#client-list');
+  section.innerHTML = `
+    <h2>${active ? esc(active.slug) : ''} · ${active ? active.workflow_id.slice(-14) : ''}</h2>
+    <div id="drafts"></div>
+    <div id="learn-summary" class="learn"></div>
+    <div id="actions">
+      <button id="refresh" class="ghost">↻ Refresh drafts</button>
+      <button id="approve" class="primary" disabled>Approve &amp; publish</button>
+    </div>`;
+  $('#refresh').onclick = pollDrafts;
+  $('#approve').onclick = approve;
+  pollDrafts();
+}
+
+async function pollDrafts() {
+  if (!active) return;
+  try {
+    const {drafts, learn} = await api(`/api/runs/${active.workflow_id}`);
+    const box = $('#drafts');
+    if (!drafts.length) {
+      box.innerHTML = '<p class="muted">Still working on it… drafts will appear here.</p>';
+    } else {
+      const tmpl = $('#draft-template');
+      box.innerHTML = '';
+      drafts.forEach((d, i) => {
+        const node = tmpl.content.cloneNode(true);
+        $('.idx', node).textContent = i;
+        $('.source', node).textContent = d.source || '';
+        $('.text', node).value = d.text;
+        node.querySelector('.tick').dataset.i = i;
+        box.appendChild(node);
+      });
+    }
+    const ls = $('#learn-summary');
+    if (learn && learn.summary) {
+      ls.innerHTML = `<h3>What worked last week</h3><p>${esc(learn.summary)}</p>`;
+    } else {
+      ls.innerHTML = '';
+    }
+    $('#approve').disabled = !drafts.length;
+  } catch(e) {
+    $('#drafts').innerHTML = `<p class="err">${esc(e.message)}</p>`;
+  }
+}
+
+async function approve() {
+  const ticks = [...document.querySelectorAll('.tick:checked')].map(t => +t.dataset.i);
+  if (!ticks.length) { alert('Tick the posts you want to publish.'); return; }
+  const btn = $('#approve');
+  btn.textContent = 'Publishing…'; btn.disabled = true;
+  try {
+    await api(`/api/runs/${active.workflow_id}/approve`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(ticks)});
+    alert('Approved & published!');
+  } catch(e) {
+    btn.textContent = 'Approve & publish'; btn.disabled = false;
+    alert(e.message);
+  }
+}
+
+loadClients();
+</script>
+</body>
+</html>

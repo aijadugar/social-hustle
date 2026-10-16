@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Compiled binaries
+*.exe
+
+# Social Hustle runtime data (per-client, keep the dirs but not the logs)
+clients/*/outbox.jsonl
+clients/*/history.jsonl
+outbox.jsonl
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
