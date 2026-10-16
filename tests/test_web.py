@@ -1,0 +1,92 @@
+"""web.py endpoint tests — offline. The Temporal client is a fake: api_runs
+must query per-slug (not a hardcoded pattern) without talking to a server."""
+import asyncio
+import json
+
+import pytest
+
+import web
+
+
+class FakeDesc:
+    def __init__(self, status_name, memo):
+        class S:  # stand-in for the protobuf IntEnum
+            name = status_name
+        self.status = S()
+        self._memo = memo
+
+    async def memo_value(self, key, default=None):
+        return self._memo.get(key, default)
+
+
+class FakeExec:
+    def __init__(self, wid, desc):
+        self.id = wid
+        self._desc = desc
+
+    async def describe(self):
+        return self._desc
+
+
+class FakeClient:
+    """Records every query so we can assert the per-slug derivation."""
+
+    def __init__(self, runs):
+        self.runs = runs      # list of FakeExec
+        self.queries = []
+
+    async def list_workflows(self, query=None):
+        self.queries.append(query)
+        pattern = query.split("'")[1]           # e.g. "brew-lane-*"
+        prefix = pattern.rstrip("*")            # e.g. "brew-lane-"
+        for r in self.runs:
+            if r.id.startswith(prefix):
+                yield r
+
+
+@pytest.fixture
+def two_clients(workdir):
+    (workdir / "clients" / "other-shop").mkdir()
+    b = json.loads((workdir / "clients" / "brew-lane" / "brand.json").read_text())
+    b["name"] = "Other Shop"
+    (workdir / "clients" / "other-shop" / "brand.json").write_text(json.dumps(b))
+    return ["brew-lane", "other-shop"]
+
+
+def test_api_runs_queries_per_client_slug(workdir, two_clients, monkeypatch):
+    runs = [
+        FakeExec("brew-lane-20261016-0800",
+                 FakeDesc("RUNNING", {"client": "brew-lane"})),
+        FakeExec("other-shop-20261016-0801",
+                 FakeDesc("COMPLETED", {"client": "other-shop"})),
+    ]
+    fc = FakeClient(runs)
+    monkeypatch.setattr(web, "client", lambda: asyncio.sleep(0, result=fc))
+
+    resp = asyncio.run(web.api_runs())
+    # jsonable responses carry a .body; accept either dict or Response
+    import json as _json
+    body = resp.body if hasattr(resp, "body") else resp
+    out = _json.loads(body) if isinstance(body, (bytes, bytearray)) else body
+
+    assert {r["workflow_id"] for r in out} == {
+        "brew-lane-20261016-0800", "other-shop-20261016-0801"}
+    assert {r["slug"] for r in out} == {"brew-lane", "other-shop"}
+    assert [r["status"] for r in out if r["slug"] == "brew-lane"] == ["running"]
+    # One query per slug, derived from the clients dir — no hardcoded pattern.
+    assert sorted(fc.queries) == sorted(
+        [f"WorkflowId = '{s}-*'" for s in two_clients])
+
+
+def test_api_runs_lists_run_without_memo(workdir, two_clients, monkeypatch):
+    """Old runs started before the client memo exist — still listed, tagged
+    with the slug the query found them under."""
+    runs = [FakeExec("brew-lane-20260101-0900", FakeDesc("FAILED", {}))]
+    fc = FakeClient(runs)
+    monkeypatch.setattr(web, "client", lambda: asyncio.sleep(0, result=fc))
+
+    import json as _json
+    body = asyncio.run(web.api_runs()).body
+    out = _json.loads(body) if isinstance(body, (bytes, bytearray)) else body
+    assert out == [{"workflow_id": "brew-lane-20260101-0900",
+                    "slug": "brew-lane", "status": "failed"}]

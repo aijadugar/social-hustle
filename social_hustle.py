@@ -34,7 +34,6 @@ from temporalio import activity, workflow
 from temporalio.client import Client, Schedule, ScheduleActionStartWorkflow, \
     ScheduleOverlapPolicy, ScheduleSpec
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import TimeoutError
 from temporalio.worker import Worker
 
 OLLAMA = "http://localhost:11434/api/chat"
@@ -145,11 +144,24 @@ async def learn(brand: dict) -> dict:
         log.warning("learn[%s]: %s — skipping performance summary", slug, reason)
         return {"summary": None, "reason": reason, "posts": posts}
 
-    for p in posted[-12:]:
+    recent = posted[-12:]
+    checked = failed = 0
+    for p in recent:
         if p.get("result") and p["result"].startswith("at://"):
-            p["likes"] = await _bluesky_likes(p["result"])
+            checked += 1
+            likes = await _bluesky_likes(p["result"])
+            if likes is None:
+                failed += 1
+                p["likes"] = None
+            else:
+                p["likes"] = likes
         else:
-            p["likes"] = 0  # dry-run record: no public engagement to read
+            p["likes"] = None  # dry-run record: no public engagement to read
+    if checked and failed == checked:
+        # Every like-count failed — there is no signal to summarize.
+        reason = "could not reach Bluesky to read engagement"
+        log.warning("learn[%s]: %s — skipping performance summary", slug, reason)
+        return {"summary": None, "reason": reason, "posts": posts}
 
     schema = {"type": "object", "properties": {"summary": {"type": "string"}},
               "required": ["summary"]}
@@ -158,26 +170,26 @@ async def learn(brand: dict) -> dict:
               f"note (2-4 sentences) on which angles, phrasing lengths, and call-to-action "
               f"styles got the most likes, and what to do more of / less of next week.\n\n"
               "Posts:\n" + "\n".join(
-                  f"- {p.get('text','')[:200]} | likes: {p.get('likes', 0)}"
-                  for p in posted[-12:]))
+                  f"- {p.get('text','')[:200]} | likes: {p['likes'] if p['likes'] is not None else 'n/a'}"
+                  for p in recent))
     res = await asyncio.to_thread(llm_json, prompt, schema)
     return {"summary": res["summary"], "reason": None, "posts": posted}
 
 
-async def _bluesky_likes(uri: str) -> int:
-    """Public like count for one post. One retry, short timeout, never raises —
-    this signal is optional and must not stall the run."""
+async def _bluesky_likes(uri: str) -> int | None:
+    """Public like count for one post. One retry, short timeout, never raises:
+    returns None only if the lookup itself failed (as opposed to 0 likes, which
+    is real data). This signal is optional and must never fail the workflow."""
     url = f"https://bsky.social/xrpc/app.bsky.feed.getLikes?uri={uri}&limit=1"
     for attempt in range(2):
         try:
-            j = json.loads(await asyncio.to_thread(
-                _get, url, timeout=LEARN_NET_TIMEOUT))
+            j = json.loads(await asyncio.to_thread(_get, url, timeout=LEARN_NET_TIMEOUT))
             likes = j.get("likes", [{}])[0].get("count", 0) if j.get("likes") else 0
             return int(likes or 0)
         except Exception as e:
             log.warning("bluesky likes failed for %s (attempt %d): %s",
                         uri, attempt + 1, e)
-    return 0
+    return None
 
 
 @activity.defn
@@ -224,25 +236,48 @@ async def publish(brand: dict, text: str) -> str:
 
     The digest is recorded as "pending" BEFORE the network call and flipped to
     "posted" after, so a crash between posting and recording can't double-post.
-    On retry a "pending" entry re-checks Bluesky for the text before posting.
+    On retry: a digest with a "posted" record is skipped outright; a lone
+    "pending" record re-checks Bluesky (or, in dry-run, the client's own
+    outbox) before anything is sent again.
     """
-    slug = brand.get("slug") or brand["name"].lower().replace(" ", "-")
+    slug = _slug(brand)
     digest = hashlib.sha256(f"{slug}:{text}".encode()).hexdigest()[:16]
     hist = os.path.join("clients", slug, "history.jsonl")
     os.makedirs(os.path.dirname(hist), exist_ok=True)
-    with open(hist, "a") as f:
-        f.write(json.dumps({"ts": time.time(), "slug": slug, "digest": digest,
-                            "text": text, "status": "pending"}) + "\n")
-    if _already_on_bluesky(text):
-        with open(hist, "a") as f:
-            f.write(json.dumps({"ts": time.time(), "slug": slug, "digest": digest,
-                                "text": text, "status": "posted", "result": "found-on-bluesky"}) + "\n")
+    records = _history_digests(hist, digest)
+    if any(r.get("status") == "posted" for r in records):
         return f"already posted ({digest})"
-    result = await asyncio.to_thread(_post, text)
-    with open(hist, "a") as f:
-        f.write(json.dumps({"ts": time.time(), "slug": slug, "digest": digest,
-                            "text": text, "status": "posted", "result": result}) + "\n")
+    if not records:  # first attempt: write the pending marker before any network call
+        _append(hist, {"ts": time.time(), "slug": slug, "digest": digest,
+                       "text": text, "status": "pending"})
+    if _already_on_bluesky(text):
+        _append(hist, {"ts": time.time(), "slug": slug, "digest": digest,
+                       "text": text, "status": "posted", "result": "found-on-bluesky"})
+        return f"already posted ({digest})"
+    result = await asyncio.to_thread(_post, text, slug)
+    _append(hist, {"ts": time.time(), "slug": slug, "digest": digest,
+                   "text": text, "status": "posted", "result": result})
     return result
+
+
+def _append(path, record: dict) -> None:
+    with open(path, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def _history_digests(hist: str, digest: str) -> list[dict]:
+    """All history lines for one digest (client+text hash)."""
+    out = []
+    if os.path.exists(hist):
+        with open(hist) as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if r.get("digest") == digest:
+                    out.append(r)
+    return out
 
 
 def _already_on_bluesky(text: str) -> bool:
@@ -262,12 +297,22 @@ def _already_on_bluesky(text: str) -> bool:
     return False
 
 
-def _post(text: str) -> str:
+def _post(text: str, slug: str) -> str:
     h, pw = os.getenv("BSKY_HANDLE"), os.getenv("BSKY_APP_PASSWORD")
     if not (h and pw):  # dry run: safe default, still proves the pipeline
-        with open("outbox.jsonl", "a") as f:
-            f.write(json.dumps({"ts": time.time(), "text": text}) + "\n")
-        return "dry-run: saved to outbox.jsonl"
+        box = os.path.join("clients", slug, "outbox.jsonl")
+        os.makedirs(os.path.dirname(box), exist_ok=True)
+        if os.path.exists(box):  # retry after a crash: same text already queued
+            with open(box) as f:
+                for line in f:
+                    try:
+                        if json.loads(line).get("text") == text:
+                            return "dry-run: already in outbox"
+                    except Exception:
+                        pass
+        with open(box, "a") as f:
+            f.write(json.dumps({"ts": time.time(), "slug": slug, "text": text}) + "\n")
+        return "dry-run: saved to clients/{slug}/outbox.jsonl"
     base = "https://bsky.social/xrpc"
     s = json.loads(_req(f"{base}/com.atproto.server.createSession",
                         {"identifier": h, "password": pw}))
@@ -313,7 +358,9 @@ class ContentRun:
         try:  # durable human-in-the-loop: client/you approve whenever, even tomorrow
             await workflow.wait_condition(lambda: self._approved is not None,
                                           timeout=timedelta(hours=48))
-        except TimeoutError:
+        except asyncio.TimeoutError:
+            pass  # state below is the source of truth
+        if self._approved is None:  # never approved within 48h: end clean, post nothing
             return []
         results = []
         for i in self._approved:

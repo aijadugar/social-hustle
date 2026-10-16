@@ -119,13 +119,10 @@ async def api_runs():
         try:
             async for w in c.list_workflows(query=f"WorkflowId = '{slug}-*'"):
                 d = await w.describe()
-                try:
-                    run_slug = await w.memo_value("client", default=None)
-                except Exception:
-                    run_slug = None
+                run_slug = await d.memo_value("client", default=None)
                 out.append({"workflow_id": w.id,
                             "slug": run_slug or slug,
-                            "status": str(d.status).split(".")[-1].lower()})
+                            "status": d.status.name.lower()})
         except Exception:
             pass
     out.sort(key=lambda r: r["workflow_id"], reverse=True)
