@@ -18,7 +18,7 @@ import re
 import sys
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from temporalio.client import Client
@@ -28,6 +28,7 @@ import social_hustle as sh
 
 HOST = os.getenv("TEMPORAL_HOST", "localhost:7233")
 PORT = int(os.getenv("PORT", "8000"))
+DASH_TOKEN = os.getenv("DASH_TOKEN", "")
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 app = FastAPI(title="Social Hustle")
@@ -47,6 +48,12 @@ def _slug(path):
     return os.path.basename(os.path.dirname(path))
 
 
+def _check_auth(request):
+    if not DASH_TOKEN:
+        return True  # auth disabled
+    return request.headers.get("X-Dash-Token") == DASH_TOKEN
+
+
 def clients():
     out = []
     for d in sorted(os.listdir("clients")):
@@ -64,12 +71,16 @@ async def index():
 
 
 @app.get("/api/clients")
-async def api_clients():
+async def api_clients(request: Request):
+    if not _check_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
     return JSONResponse(clients())
 
 
 @app.post("/api/runs/{slug}")
-async def api_run(slug: str):
+async def api_run(slug: str, request: Request):
+    if not _check_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
     p = os.path.join("clients", slug, "brand.json")
     if not os.path.exists(p):
         raise HTTPException(404, f"unknown client {slug}")
@@ -82,7 +93,9 @@ async def api_run(slug: str):
 
 
 @app.get("/api/runs/{wid}")
-async def api_drafts(wid: str):
+async def api_drafts(wid: str, request: Request):
+    if not _check_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
     c = await client()
     h = c.get_workflow_handle(wid)
     try:
@@ -94,7 +107,9 @@ async def api_drafts(wid: str):
 
 
 @app.post("/api/runs/{wid}/approve")
-async def api_approve(wid: str, indexes: list[int]):
+async def api_approve(wid: str, indexes: list[int], request: Request):
+    if not _check_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
     c = await client()
     h = c.get_workflow_handle(wid)
     await h.signal("approve", indexes)
@@ -102,7 +117,7 @@ async def api_approve(wid: str, indexes: list[int]):
 
 
 @app.get("/api/runs")
-async def api_runs():
+async def api_runs(request: Request):
     """Recent runs for the dashboard, newest first.
 
     The Temporal query is derived from the actual clients/*/ slugs, so any
@@ -110,6 +125,8 @@ async def api_runs():
     run carries a `client` memo set at start; we read it back to tag the run
     with the slug even if the workflow id was renamed later.
     """
+    if not _check_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
     c = await client()
     slugs = [d for d in os.listdir("clients")
              if os.path.isdir(os.path.join("clients", d))
