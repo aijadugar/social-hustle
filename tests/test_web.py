@@ -150,3 +150,36 @@ def test_api_runs_no_token_when_unset(workdir, two_clients, monkeypatch):
     import json as _json
     out = _json.loads(body) if isinstance(body, (bytes, bytearray)) else body
     assert [r["workflow_id"] for r in out] == ["brew-lane-20261016-0800"]
+
+
+# ---------------------------------------------------------------- bind guard
+def test_main_refuses_non_loopback_without_token(monkeypatch):
+    """A non-loopback bind with no DASH_TOKEN must refuse to start."""
+    monkeypatch.setattr(web, "DASH_TOKEN", "")
+    monkeypatch.setenv("HOST", "0.0.0.0")
+    monkeypatch.setattr(web.uvicorn, "run", lambda *a, **k: None)
+    with pytest.raises(SystemExit) as ei:
+        web.main()
+    assert "DASH_TOKEN" in str(ei.value)
+
+
+def test_main_allows_non_loopback_with_token(monkeypatch):
+    """With DASH_TOKEN set, a non-loopback bind is allowed."""
+    monkeypatch.setattr(web, "DASH_TOKEN", "secret")
+    monkeypatch.setenv("HOST", "0.0.0.0")
+    calls = {}
+    monkeypatch.setattr(web.uvicorn, "run",
+                        lambda app, host, port: calls.update(host=host, port=port))
+    web.main()
+    assert calls == {"host": "0.0.0.0", "port": 8000}
+
+
+def test_main_defaults_to_loopback(monkeypatch):
+    """No HOST override -> 127.0.0.1, even without a token."""
+    monkeypatch.setattr(web, "DASH_TOKEN", "")
+    monkeypatch.delenv("HOST", raising=False)
+    calls = {}
+    monkeypatch.setattr(web.uvicorn, "run",
+                        lambda app, host, port: calls.update(host=host, port=port))
+    web.main()
+    assert calls == {"host": "127.0.0.1", "port": 8000}
