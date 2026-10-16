@@ -4,6 +4,7 @@ import asyncio
 import json
 
 import pytest
+from fastapi import HTTPException
 
 import web
 
@@ -53,6 +54,10 @@ def two_clients(workdir):
     return ["brew-lane", "other-shop"]
 
 
+class Req:
+    headers = {}
+
+
 def test_api_runs_queries_per_client_slug(workdir, two_clients, monkeypatch):
     runs = [
         FakeExec("brew-lane-20261016-0800",
@@ -63,7 +68,7 @@ def test_api_runs_queries_per_client_slug(workdir, two_clients, monkeypatch):
     fc = FakeClient(runs)
     monkeypatch.setattr(web, "client", lambda: asyncio.sleep(0, result=fc))
 
-    resp = asyncio.run(web.api_runs())
+    resp = asyncio.run(web.api_runs(Req()))
     # jsonable responses carry a .body; accept either dict or Response
     import json as _json
     body = resp.body if hasattr(resp, "body") else resp
@@ -85,9 +90,8 @@ def test_api_runs_lists_run_without_memo(workdir, two_clients, monkeypatch):
     fc = FakeClient(runs)
     monkeypatch.setattr(web, "client", lambda: asyncio.sleep(0, result=fc))
 
-    import json as _json
-    body = asyncio.run(web.api_runs()).body
-    out = _json.loads(body) if isinstance(body, (bytes, bytearray)) else body
+    body = asyncio.run(web.api_runs(Req())).body
+    out = json.loads(body) if isinstance(body, (bytes, bytearray)) else body
     assert out == [{"workflow_id": "brew-lane-20260101-0900",
                     "slug": "brew-lane", "status": "failed"}]
 
@@ -100,14 +104,12 @@ def test_api_runs_unauthenticated_when_token_set(workdir, two_clients, monkeypat
     monkeypatch.setattr(web, "client", lambda: asyncio.sleep(0, result=fc))
     monkeypatch.setattr(web, "DASH_TOKEN", "secret")
 
-    async def call():
-        return await web.api_runs()
-
-    resp = asyncio.run(call())
-    body = resp.body if hasattr(resp, "body") else resp
-    import json as _json
-    out = _json.loads(body) if isinstance(body, (bytes, bytearray)) else body
-    assert out["status_code"] == 401
+    # web.py raises HTTPException(401) — the FastAPI layer turns that into a
+    # 401 response, so the handler itself raises. Drive it through the same
+    # path the other auth tests use.
+    with pytest.raises(HTTPException) as ei:
+        asyncio.run(web.api_runs(Req()))
+    assert ei.value.status_code == 401
 
 
 def test_api_runs_authenticated_with_token(workdir, two_clients, monkeypatch):
