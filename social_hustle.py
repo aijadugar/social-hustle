@@ -41,6 +41,9 @@ MODEL = os.getenv("MODEL", "gemma3:4b")
 QUEUE = "social-hustle"
 # MOCK_LLM=1: skip Ollama, return canned schema-valid JSON. Smoke tests + demo.
 MOCK_LLM = os.getenv("MOCK_LLM", "0") == "1"
+# Per-call timeout for the Ollama structured-output call. Gemma on a slow box can
+# take a while for the first response; raise it if you see "timed out".
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "180"))
 
 
 # ---------- helpers (blocking; run in threads) ----------
@@ -86,7 +89,19 @@ def llm_json(prompt, schema):
     body = {"model": MODEL, "stream": False, "format": schema,
             "messages": [{"role": "user", "content": prompt}],
             "options": {"temperature": 0.7}}
-    raw = json.loads(_req(OLLAMA, body))["message"]["content"]
+    # Structured output on a cold/slow box can exceed a single timeout. Retry
+    # with backoff before giving up — a transient timeout shouldn't kill the run.
+    last = None
+    for attempt in range(3):
+        try:
+            raw = json.loads(_req(OLLAMA, body, timeout=LLM_TIMEOUT))["message"]["content"]
+            break
+        except Exception as e:
+            last = e
+            if attempt == 2:
+                raise
+            log.warning("llm_json attempt %d failed: %s", attempt + 1, e)
+            time.sleep(2 ** attempt)
     # Strip possible markdown code fences
     stripped = raw.strip()
     if stripped.startswith("```"):
