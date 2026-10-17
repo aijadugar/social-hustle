@@ -32,7 +32,7 @@ log = logging.getLogger("social_hustle")
 
 from temporalio import activity, workflow
 from temporalio.client import Client, Schedule, ScheduleActionStartWorkflow, \
-    ScheduleOverlapPolicy, ScheduleSpec
+    ScheduleOverlapPolicy, SchedulePolicy, ScheduleSpec
 from temporalio.common import RetryPolicy
 from temporalio.worker import Worker
 
@@ -437,7 +437,8 @@ async def main():
                         ContentRun.run, brand, id=f"{slug}-{datetime.now():%Y%m%d}",
                         task_queue=QUEUE, memo={"client": slug}),
                     spec=ScheduleSpec(cron_expressions=["0 8 * * 1-5"]),
-                    policy=type("P", (), {"overlap": ScheduleOverlapPolicy.SKIP})()),
+                    policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP),
+                ),
             )
             print(f"Schedule {sid}: weekday 8am -> ContentRun for {brand['name']}")
     else:
