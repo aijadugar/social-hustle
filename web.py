@@ -22,6 +22,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from temporalio.client import Client
+import uvicorn
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import social_hustle as sh
@@ -152,7 +153,6 @@ def _sanitize(name):
 
 def main():
     """Bind the dashboard. Local-first: loopback by default, HOST overrides."""
-    import uvicorn
     host = os.getenv("HOST", "127.0.0.1")
     if not DASH_TOKEN and host != "127.0.0.1":
         sys.exit("refusing to bind a non-loopback address without DASH_TOKEN set")
