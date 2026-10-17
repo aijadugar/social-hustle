@@ -43,7 +43,7 @@ QUEUE = "social-hustle"
 MOCK_LLM = os.getenv("MOCK_LLM", "0") == "1"
 # Per-call timeout for the Ollama structured-output call. Gemma on a slow box can
 # take a while for the first response; raise it if you see "timed out".
-LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "180"))
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "600"))
 
 
 # ---------- helpers (blocking; run in threads) ----------
@@ -89,30 +89,67 @@ def llm_json(prompt, schema):
     body = {"model": MODEL, "stream": False, "format": schema,
             "messages": [{"role": "user", "content": prompt}],
             "options": {"temperature": 0.7}}
-    # Structured output on a cold/slow box can exceed a single timeout. Retry
-    # with backoff before giving up — a transient timeout shouldn't kill the run.
-    last = None
+    # Structured output on a cold/slow box can exceed a single timeout, and
+    # gemma3:4b sometimes cuts its response off mid-string. Retry with backoff
+    # before giving up — a transient failure shouldn't kill the run.
     for attempt in range(3):
         try:
             raw = json.loads(_req(OLLAMA, body, timeout=LLM_TIMEOUT))["message"]["content"]
-            break
+            return _parse_with_repair(raw)
         except Exception as e:
-            last = e
             if attempt == 2:
                 raise
             log.warning("llm_json attempt %d failed: %s", attempt + 1, e)
             time.sleep(2 ** attempt)
-    # Strip possible markdown code fences
+
+
+def _strip_fences(raw):
+    """Remove a markdown ```json ... ``` wrapper if present."""
     stripped = raw.strip()
     if stripped.startswith("```"):
-        # remove first line
         lines = stripped.splitlines()
         if lines[0].startswith("```"):
             lines = lines[1:]
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         stripped = "\n".join(lines).strip()
-    return json.loads(stripped)
+    return stripped
+
+
+def _parse_with_repair(raw):
+    """Parse the model's JSON, repairing truncation if needed.
+
+    gemma3:4b occasionally returns a response cut off mid-string (e.g.
+    'Unterminated string starting at: line 17'). Rather than failing the whole
+    activity, walk back to the last point where the JSON is complete and valid.
+    """
+    text = _strip_fences(raw)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Only candidate cut points can end valid JSON: a closing brace/bracket or
+    # a closing quote. This keeps the O(n) scan cheap instead of re-parsing at
+    # every character.
+    for i in range(len(text), 0, -1):
+        if text[i - 1] not in '}]"':
+            continue
+        cand = text[:i].rstrip()
+        try:
+            log.warning("llm_json: repaired truncated response (kept %d of %d chars)",
+                        i, len(text))
+            return json.loads(cand)
+        except json.JSONDecodeError:
+            continue
+    # Last resort: the response was cut before any closing bracket. Try closing
+    # the last unterminated string and then the open containers.
+    for suffix in ('"}', '"]}', '}}', ']}', '"]', '"}', '"]'):
+        try:
+            log.warning("llm_json: repaired truncated response (appended %r)", suffix)
+            return json.loads(text + suffix)
+        except json.JSONDecodeError:
+            continue
+    raise ValueError("no valid JSON in model response")
 
 
 # ---------- activities ----------

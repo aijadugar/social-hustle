@@ -153,3 +153,36 @@ def test_learn_produces_summary_when_data_is_there(brand, workdir, monkeypatch):
     assert res["summary"]
     assert res["reason"] is None
     assert {p["likes"] for p in res["posts"]} == {7}
+
+
+# ---------------------------------------------------------------- json repair
+def test_parse_with_repair_valid():
+    raw = '{"picks": [{"title": "x", "link": "u", "why_it_fits": "y", "score": 9}]}'
+    assert sh._parse_with_repair(raw)["picks"][0]["score"] == 9
+
+
+def test_parse_with_repair_strips_fences():
+    raw = '```json\n{"picks": [{"title": "x"}]}\n```'
+    assert sh._parse_with_repair(raw)["picks"][0]["title"] == "x"
+
+
+def test_parse_with_repair_truncated_mid_string():
+    """gemma3:4b sometimes cuts its response off mid-string; the closing
+    braces are still present, so walking back to the last valid cut point
+    recovers a complete object."""
+    good = ('{"picks": [{"title": "Coffee prices are climbing here is what that '
+            'means for your brew", "link": "https://example.com/a", "why_it_fits": '
+            '"This is a consistently relevant topic for our audience. We can '
+            'position Brew Lane as a trusted source for understanding the factors '
+            'driving price increases traceability, climate change impacts on crops, '
+            'and we can use this to showcase our values.", "score": 7}]}')
+    trunc = good[:1575]
+    assert trunc.endswith("}]}")  # the closing containers are still present
+    out = sh._parse_with_repair(trunc)
+    assert out["picks"][0]["score"] == 7
+    assert out["picks"][0]["title"].startswith("Coffee prices")
+
+
+def test_parse_with_repair_unrepairable_raises():
+    with pytest.raises(ValueError):
+        sh._parse_with_repair('{"picks": [{"title": "x"')
