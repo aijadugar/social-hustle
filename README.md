@@ -33,7 +33,7 @@ temporal server start-dev
 # terminal 3 — the worker that runs the workflow
 python social_hustle.py worker
 
-# terminal 4 — start a run for a client
+# terminal 4 — start a run for a client, or run the dashboard instead
 python social_hustle.py run clients/brew-lane/brand.json
 # -> Started brew-lane-20261017-1101
 # -> Next: python social_hustle.py show brew-lane-20261017-1101
@@ -58,6 +58,25 @@ workflow never loses state. Drafts you don't tick are simply not posted.
 ```bash
 python web.py          # http://localhost:8000 — list clients, start runs, approve
 ```
+
+The dashboard is the full UI for terminal 4. It lists your clients, starts a
+run with one click ("Generate this week's posts"), polls drafts as they
+appear, and publishes the ones you tick. Same endpoints as the CLI, so you can
+mix the two.
+
+## Faster model
+
+`gemma3:4b` is accurate but slow (~2 min/call on a modest box, ~4 min per
+full run). Pull a smaller model to speed it up:
+
+```bash
+ollama pull gemma3:1b
+MODEL=gemma3:1b python social_hustle.py worker
+```
+
+`gemma3:1b` is ~10× faster and still good enough for picking angles and
+writing short posts. Bump it back up to `gemma3:4b` (or `gemma3:12b`) when
+you want quality over speed.
 
 FastAPI + one static HTML file, no build step, no JS framework.
 
