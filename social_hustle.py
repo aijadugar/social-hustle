@@ -89,18 +89,21 @@ def llm_json(prompt, schema):
     body = {"model": MODEL, "stream": False, "format": schema,
             "messages": [{"role": "user", "content": prompt}],
             "options": {"temperature": 0.7}}
-    # Structured output on a cold/slow box can exceed a single timeout, and
-    # gemma3:4b sometimes cuts its response off mid-string. Retry with backoff
-    # before giving up — a transient failure shouldn't kill the run.
-    for attempt in range(3):
+    # Structured output on a cold/slow box can exceed a single timeout, gemma3:4b
+    # sometimes cuts its response off mid-string, and Ollama can 404 while
+    # reloading the model. Retry with growing backoff before giving up — a
+    # transient failure shouldn't kill the run.
+    for attempt in range(5):
         try:
             raw = json.loads(_req(OLLAMA, body, timeout=LLM_TIMEOUT))["message"]["content"]
             return _parse_with_repair(raw)
         except Exception as e:
-            if attempt == 2:
+            if attempt == 4:
                 raise
-            log.warning("llm_json attempt %d failed: %s", attempt + 1, e)
-            time.sleep(2 ** attempt)
+            delay = 3 * (2 ** attempt)      # 3s, 6s, 12s, 24s
+            log.warning("llm_json attempt %d failed: %s (retrying in %ds)",
+                        attempt + 1, e, delay)
+            time.sleep(delay)
 
 
 def _strip_fences(raw):

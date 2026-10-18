@@ -6,6 +6,7 @@ a real worker so no Temporal server is needed.
 """
 import asyncio
 import json
+import urllib.error
 
 import pytest
 from temporalio.testing import ActivityEnvironment
@@ -193,3 +194,34 @@ def test_parse_with_repair_trailing_comma():
 def test_parse_with_repair_unrepairable_raises():
     with pytest.raises(ValueError):
         sh._parse_with_repair("")
+
+
+# ---------------------------------------------------------------- llm_json retry
+def test_llm_json_retries_on_transient_failure(monkeypatch):
+    """Ollama can 404 while reloading a model; the call must retry and succeed."""
+    monkeypatch.setattr(sh, "MOCK_LLM", False)
+    calls = {"n": 0}
+
+    def fake_req(url, body=None, headers=None, timeout=300):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+        return json.dumps({"message": {"content": '{"picks": [{"title": "x"}]}'}})
+
+    monkeypatch.setattr(sh, "_req", fake_req)
+    monkeypatch.setattr(sh.time, "sleep", lambda *_: None)
+    out = sh.llm_json("prompt", {"type": "object"})
+    assert out["picks"][0]["title"] == "x"
+    assert calls["n"] == 3
+
+
+def test_llm_json_raises_after_retries_exhausted(monkeypatch):
+    monkeypatch.setattr(sh, "MOCK_LLM", False)
+
+    def fake_req(url, body=None, headers=None, timeout=300):
+        raise urllib.error.HTTPError(url, 503, "Unavailable", {}, None)
+
+    monkeypatch.setattr(sh, "_req", fake_req)
+    monkeypatch.setattr(sh.time, "sleep", lambda *_: None)
+    with pytest.raises(urllib.error.HTTPError):
+        sh.llm_json("prompt", {"type": "object"})
