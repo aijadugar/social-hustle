@@ -284,6 +284,27 @@ async def _bluesky_likes(uri: str) -> int | None:
     return None
 
 
+def _normalize_picks(picks):
+    """Keep only picks with the fields the downstream code reads.
+
+    Ollama's structured output isn't strictly enforced, and a repaired
+    truncated response can leave a pick missing a field. Rather than crash the
+    activity on a KeyError, drop the malformed pick and default missing scores
+    to 0 so a partial response still produces a usable run.
+    """
+    out = []
+    for p in picks:
+        if not isinstance(p, dict) or not p.get("title") or not p.get("link"):
+            continue
+        try:
+            score = int(p.get("score", 0))
+        except (TypeError, ValueError):
+            score = 0
+        out.append({"title": str(p["title"]), "link": str(p["link"]),
+                    "why_it_fits": str(p.get("why_it_fits", "")), "score": score})
+    return out
+
+
 @activity.defn
 async def analyze(brand: dict, items: list[dict], learn: dict | None = None) -> list[dict]:
     schema = {"type": "object", "properties": {"picks": {"type": "array", "items": {
@@ -300,7 +321,8 @@ async def analyze(brand: dict, items: list[dict], learn: dict | None = None) -> 
               "Score 1-10 for audience relevance. Skip anything off-brand or risky. "
               "Prefer angles and phrasing that match what worked last week.")
     res = await asyncio.to_thread(llm_json, prompt, schema)
-    return sorted(res["picks"], key=lambda p: -p["score"])[:3]
+    return sorted(_normalize_picks(res.get("picks", [])),
+                  key=lambda p: -p["score"])[:3]
 
 
 @activity.defn
@@ -318,7 +340,12 @@ async def draft(brand: dict, picks: list[dict], learn: dict | None = None) -> li
               "Do not invent facts beyond the headline. " + mirror + "\n\nTopics:\n" +
               "\n".join(f"- {p['title']} ({p['why_it_fits']}) {p['link']}" for p in picks))
     res = await asyncio.to_thread(llm_json, prompt, schema)
-    return [{"text": p["text"][:300], "source": p["source"]} for p in res["posts"]]
+    out = []
+    for p in res.get("posts", []):
+        if not isinstance(p, dict) or not p.get("text") or not p.get("source"):
+            continue
+        out.append({"text": str(p["text"])[:300], "source": str(p["source"])})
+    return out
 
 
 @activity.defn

@@ -73,6 +73,32 @@ def test_analyze_includes_learn_section_when_summary_present(brand):
     assert "What worked last week: Short questions won." in captured["prompt"]
 
 
+def test_analyze_drops_malformed_picks(brand):
+    """Ollama's structured output isn't strictly enforced and a repaired
+    truncated response can leave a pick missing a field. The activity must
+    not crash on a KeyError — it drops picks missing title/link and defaults
+    the score of the rest to 0."""
+    real = sh.llm_json
+
+    def fake(prompt, schema):
+        return {"picks": [
+            {"title": "good", "link": "https://example.com/a",
+             "why_it_fits": "fits", "score": 9},
+            {"title": "broken", "link": "https://example.com/b"},   # no score
+            {"link": "https://example.com/c"},                       # no title
+        ]}
+
+    sh.llm_json = fake
+    try:
+        picks = _run(sh.analyze, brand, [{"title": "t", "link": "l"}])
+    finally:
+        sh.llm_json = real
+    assert len(picks) == 2
+    assert picks[0]["title"] == "good"
+    assert picks[0]["score"] == 9
+    assert picks[1]["score"] == 0
+
+
 # ---------------------------------------------------------------- draft
 def test_draft_returns_posts_with_text_and_source(brand):
     picks = [{"title": "Coffee prices are climbing", "link": "https://example.com/a",
@@ -100,6 +126,28 @@ def test_draft_respects_voice_and_never(brand):
         sh.llm_json = real
     assert brand["voice"] in captured["prompt"]
     assert brand["avoid"] in captured["prompt"]
+
+
+def test_draft_drops_malformed_posts(brand):
+    """A repaired/truncated response can leave a post missing text or source.
+    The activity must not crash — it keeps the valid ones."""
+    real = sh.llm_json
+
+    def fake(prompt, schema):
+        return {"posts": [
+            {"text": "real post", "source": "https://example.com/a"},
+            {"source": "https://example.com/b"},        # no text
+            {"text": "no source"},                      # no source
+        ]}
+
+    sh.llm_json = fake
+    try:
+        posts = _run(sh.draft, brand,
+                     [{"title": "t", "link": "l", "why_it_fits": "w", "score": 8}])
+    finally:
+        sh.llm_json = real
+    assert len(posts) == 1
+    assert posts[0]["text"] == "real post"
 
 
 # ---------------------------------------------------------------- learn
