@@ -3,9 +3,9 @@
 social_hustle.py - a done-for-you social media engine for small-business clients.
 
 Pipeline (one durable Temporal workflow per client per day):
-  research (Google News RSS) -> analyze (local Gemma ranks angles for the brand)
-  -> draft (Gemma writes posts in the client's voice) -> HUMAN APPROVAL (signal)
-  -> publish (Bluesky; dry-run outbox if no creds)
+  research (Google News RSS) -> learn (what worked last week)
+  -> write (local Gemma picks angles AND writes posts in one call)
+  -> HUMAN APPROVAL (signal) -> publish (Bluesky; dry-run outbox if no creds)
 
 Open pieces: Gemma via Ollama (local, $0/post, client data stays on your box),
 Temporal (durable, retries, waits for approval without losing state).
@@ -62,16 +62,10 @@ def _get(url, timeout=30):
 
 def _mock(prompt, schema):
     """Canned, schema-valid responses. Detect the activity by a keyword in the
-    prompt so one function covers analyze / draft / learn."""
-    if "Pick the 3 headlines" in prompt:
-        return {"picks": [
-            {"title": "Coffee prices are climbing — here's what that means for your brew",
-             "link": "https://example.com/a", "why_it_fits": "Direct, useful angle home brewers care about.", "score": 9},
-            {"title": "New study says specialty beans keep their flavor longer",
-             "link": "https://example.com/b", "why_it_fits": "Teaches the audience something.", "score": 8},
-            {"title": "Local roasters band together on a new sustainability pledge",
-             "link": "https://example.com/c", "why_it_fits": "Community angle, on-brand.", "score": 7}]}
-    if "Write one social post" in prompt:
+    prompt so one function covers write / learn."""
+    # write (merged analyze+draft): match case-insensitively since the merged
+    # prompt says "write one social post" rather than the old "Write one...".
+    if "write one social post" in prompt.lower():
         return {"posts": [
             {"text": "Coffee prices are up. We're not marking up our beans — here's what's actually happening and how to brew around it.",
              "source": "https://example.com/a"},
@@ -184,21 +178,26 @@ def _parse_with_repair(raw):
 # ---------- activities ----------
 @activity.defn
 async def research(brand: dict) -> list[dict]:
-    def go():
-        items = []
-        for kw in brand["keywords"]:
-            q = urllib.parse.quote(f"{kw} when:7d")
-            xml = _req(f"https://news.google.com/rss/search?q={q}", timeout=30)
-            for it in ET.fromstring(xml).iterfind(".//item"):
-                items.append({"title": it.findtext("title"), "link": it.findtext("link")})
-                if len(items) % 6 == 0:
-                    break
-        seen, out = set(), []
-        for i in items:
-            if i["title"] not in seen:
-                seen.add(i["title"]); out.append(i)
-        return out[:20]
-    return await asyncio.to_thread(go)
+    """Fetch one RSS feed per keyword. The feeds are independent, so fetch
+    them concurrently rather than one keyword at a time."""
+    def one(kw):
+        q = urllib.parse.quote(f"{kw} when:7d")
+        xml = _req(f"https://news.google.com/rss/search?q={q}", timeout=30)
+        out = []
+        for it in ET.fromstring(xml).iterfind(".//item"):
+            out.append({"title": it.findtext("title"), "link": it.findtext("link")})
+            if len(out) >= 6:
+                break
+        return out
+
+    raw = await asyncio.gather(*(asyncio.to_thread(one, kw)
+                                 for kw in brand["keywords"]))
+    items = [i for batch in raw for i in batch]
+    seen, out = set(), []
+    for i in items:
+        if i["title"] not in seen:
+            seen.add(i["title"]); out.append(i)
+    return out[:20]
 
 
 # How long to wait on the public Bluesky like-count lookups. Short: this is a
@@ -237,18 +236,20 @@ async def learn(brand: dict) -> dict:
         return {"summary": None, "reason": reason, "posts": posts}
 
     recent = posted[-12:]
-    checked = failed = 0
+    # Public like-count lookups are independent and slow; run them in parallel
+    # instead of one-at-a-time. This signal is optional and must never stall
+    # the run, so a failure on one post just leaves it as None.
+    to_check = [p for p in recent
+                if p.get("result") and p["result"].startswith("at://")]
+    if to_check:
+        results = await asyncio.gather(*(_bluesky_likes(p["result"]) for p in to_check))
+        for p, likes in zip(to_check, results):
+            p["likes"] = likes
     for p in recent:
-        if p.get("result") and p["result"].startswith("at://"):
-            checked += 1
-            likes = await _bluesky_likes(p["result"])
-            if likes is None:
-                failed += 1
-                p["likes"] = None
-            else:
-                p["likes"] = likes
-        else:
+        if "likes" not in p:
             p["likes"] = None  # dry-run record: no public engagement to read
+    checked = len(to_check)
+    failed = sum(1 for p in to_check if p["likes"] is None)
     if checked and failed == checked:
         # Every like-count failed — there is no signal to summarize.
         reason = "could not reach Bluesky to read engagement"
@@ -306,39 +307,33 @@ def _normalize_picks(picks):
 
 
 @activity.defn
-async def analyze(brand: dict, items: list[dict], learn: dict | None = None) -> list[dict]:
-    schema = {"type": "object", "properties": {"picks": {"type": "array", "items": {
-        "type": "object", "properties": {
-            "title": {"type": "string"}, "link": {"type": "string"},
-            "why_it_fits": {"type": "string"}, "score": {"type": "integer"}},
-        "required": ["title", "link", "why_it_fits", "score"]}}}, "required": ["picks"]}
-    prompt = (f"You are a social media strategist for {brand['name']}: {brand['about']}\n"
-              f"Audience: {brand['audience']}\n"
-              f"{_worked_section(learn)}\n\n"
-              "Headlines this week:\n" +
-              "\n".join(f"- {i['title']} | {i['link']}" for i in items) +
-              "\n\nPick the 3 headlines this brand can comment on credibly and usefully. "
-              "Score 1-10 for audience relevance. Skip anything off-brand or risky. "
-              "Prefer angles and phrasing that match what worked last week.")
-    res = await asyncio.to_thread(llm_json, prompt, schema)
-    return sorted(_normalize_picks(res.get("picks", [])),
-                  key=lambda p: -p["score"])[:3]
+async def write(brand: dict, items: list[dict], learn: dict | None = None) -> list[dict]:
+    """One LLM call that both picks angles AND writes the posts.
 
-
-@activity.defn
-async def draft(brand: dict, picks: list[dict], learn: dict | None = None) -> list[dict]:
+    Merging analyze + draft into a single call halves the dominant cost: on a
+    slow box each structured-output call is the bottleneck, so two sequential
+    calls are roughly twice as slow as one. The model still reasons about
+    which headlines to use before writing, just in one shot.
+    """
     schema = {"type": "object", "properties": {"posts": {"type": "array", "items": {
-        "type": "object", "properties": {"text": {"type": "string"}, "source": {"type": "string"}},
+        "type": "object", "properties": {
+            "text": {"type": "string"}, "source": {"type": "string"},
+            "why_it_fits": {"type": "string"}, "score": {"type": "integer"}},
         "required": ["text", "source"]}}}, "required": ["posts"]}
     mirror = ("Mirror the phrasing style and call-to-action format that worked "
               "last week." if learn and learn.get("summary") else
               "Mirror the brand's own voice and avoid format.")
-    prompt = (f"Write one social post per topic for {brand['name']}.\n"
+    prompt = (f"You are a social media strategist for {brand['name']}: {brand['about']}\n"
+              f"Audience: {brand['audience']}\n"
               f"Voice: {brand['voice']}\nNever: {brand.get('avoid', 'hype, emojis spam')}\n"
-              f"{_worked_section(learn)}\n"
-              "Max 280 characters each. Add a clear point of view and a soft call to action. "
-              "Do not invent facts beyond the headline. " + mirror + "\n\nTopics:\n" +
-              "\n".join(f"- {p['title']} ({p['why_it_fits']}) {p['link']}" for p in picks))
+              f"{_worked_section(learn)}\n\n"
+              "Headlines this week:\n" +
+              "\n".join(f"- {i['title']} | {i['link']}" for i in items) +
+              "\n\nPick the 3 headlines this brand can comment on credibly and usefully. "
+              "For each, write one social post in the brand's voice: max 280 characters, "
+              "a clear point of view, a soft call to action, and no invented facts beyond "
+              "the headline. Score 1-10 for audience relevance. Skip anything off-brand "
+              "or risky. " + mirror)
     res = await asyncio.to_thread(llm_json, prompt, schema)
     out = []
     for p in res.get("posts", []):
@@ -470,9 +465,8 @@ class ContentRun:
                                              initial_interval=timedelta(seconds=5)))
         items = await workflow.execute_activity(research, brand, **opts)
         self._learn = await workflow.execute_activity(learn, brand, **opts)
-        picks = await workflow.execute_activity(analyze, args=[brand, items, self._learn], **opts)
         self._drafts = await workflow.execute_activity(
-            draft, args=[brand, picks, self._learn], **opts)
+            write, args=[brand, items, self._learn], **opts)
 
         try:  # durable human-in-the-loop: client/you approve whenever, even tomorrow
             await workflow.wait_condition(lambda: self._approved is not None,

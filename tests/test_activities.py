@@ -1,4 +1,4 @@
-"""Tests for the LLM-driven activities: analyze, draft, learn.
+"""Tests for the LLM-driven activities: write (analyze+draft merged), learn.
 
 No network: MOCK_LLM=1 gives canned schema-valid JSON, and the activity
 runner (temporalio.testing.ActivityEnvironment) executes activities outside
@@ -20,23 +20,22 @@ def _run(fn, *args, **kwargs):
     return asyncio.run(ActivityEnvironment().run(fn, *args, **kwargs))
 
 
-# ---------------------------------------------------------------- analyze
-def test_analyze_returns_top_3_sorted_by_score(brand):
+# ---------------------------------------------------------------- write
+def test_write_returns_posts_with_text_and_source(brand):
     items = [{"title": "Coffee prices are climbing", "link": "https://example.com/a"},
              {"title": "New study says specialty beans keep their flavor longer",
               "link": "https://example.com/b"},
              {"title": "Local roasters band together on a sustainability pledge",
               "link": "https://example.com/c"}]
-    picks = _run(sh.analyze, brand, items)
-    assert len(picks) == 3
-    scores = [p["score"] for p in picks]
-    assert scores == sorted(scores, reverse=True)
-    for p in picks:
-        assert set(p) == {"title", "link", "why_it_fits", "score"}
-        assert isinstance(p["score"], int)
+    posts = _run(sh.write, brand, items)
+    assert len(posts) == 2
+    for p in posts:
+        assert set(p) == {"text", "source"}
+        assert len(p["text"]) <= 300
+        assert p["source"].startswith("https://")
 
 
-def test_analyze_skips_learn_section_when_no_summary(brand, workdir, caplog):
+def test_write_skips_learn_section_when_no_summary(brand, workdir, caplog):
     """A cold start (no performance data) must not inject a null summary into
     the prompt — the section is simply absent."""
     captured = {}
@@ -49,14 +48,14 @@ def test_analyze_skips_learn_section_when_no_summary(brand, workdir, caplog):
 
     sh.llm_json = fake
     try:
-        _run(sh.analyze, brand, [{"title": "t", "link": "l"}],
+        _run(sh.write, brand, [{"title": "t", "link": "l"}],
              learn={"summary": None, "reason": "no data"})
     finally:
         sh.llm_json = real
     assert "What worked last week" not in captured["prompt"]
 
 
-def test_analyze_includes_learn_section_when_summary_present(brand):
+def test_write_includes_learn_section_when_summary_present(brand):
     captured = {}
     real = sh.llm_json
 
@@ -66,52 +65,14 @@ def test_analyze_includes_learn_section_when_summary_present(brand):
 
     sh.llm_json = fake
     try:
-        _run(sh.analyze, brand, [{"title": "t", "link": "l"}],
+        _run(sh.write, brand, [{"title": "t", "link": "l"}],
              learn={"summary": "Short questions won."})
     finally:
         sh.llm_json = real
     assert "What worked last week: Short questions won." in captured["prompt"]
 
 
-def test_analyze_drops_malformed_picks(brand):
-    """Ollama's structured output isn't strictly enforced and a repaired
-    truncated response can leave a pick missing a field. The activity must
-    not crash on a KeyError — it drops picks missing title/link and defaults
-    the score of the rest to 0."""
-    real = sh.llm_json
-
-    def fake(prompt, schema):
-        return {"picks": [
-            {"title": "good", "link": "https://example.com/a",
-             "why_it_fits": "fits", "score": 9},
-            {"title": "broken", "link": "https://example.com/b"},   # no score
-            {"link": "https://example.com/c"},                       # no title
-        ]}
-
-    sh.llm_json = fake
-    try:
-        picks = _run(sh.analyze, brand, [{"title": "t", "link": "l"}])
-    finally:
-        sh.llm_json = real
-    assert len(picks) == 2
-    assert picks[0]["title"] == "good"
-    assert picks[0]["score"] == 9
-    assert picks[1]["score"] == 0
-
-
-# ---------------------------------------------------------------- draft
-def test_draft_returns_posts_with_text_and_source(brand):
-    picks = [{"title": "Coffee prices are climbing", "link": "https://example.com/a",
-              "why_it_fits": "home brewers care", "score": 9}]
-    posts = _run(sh.draft, brand, picks)
-    assert len(posts) == 2
-    for p in posts:
-        assert set(p) == {"text", "source"}
-        assert len(p["text"]) <= 300
-        assert p["source"].startswith("https://")
-
-
-def test_draft_respects_voice_and_never(brand):
+def test_write_respects_voice_and_never(brand):
     captured = {}
     real = sh.llm_json
 
@@ -121,14 +82,14 @@ def test_draft_respects_voice_and_never(brand):
 
     sh.llm_json = fake
     try:
-        _run(sh.draft, brand, [{"title": "t", "link": "l", "why_it_fits": "w", "score": 8}])
+        _run(sh.write, brand, [{"title": "t", "link": "l", "why_it_fits": "w", "score": 8}])
     finally:
         sh.llm_json = real
     assert brand["voice"] in captured["prompt"]
     assert brand["avoid"] in captured["prompt"]
 
 
-def test_draft_drops_malformed_posts(brand):
+def test_write_drops_malformed_posts(brand):
     """A repaired/truncated response can leave a post missing text or source.
     The activity must not crash — it keeps the valid ones."""
     real = sh.llm_json
@@ -142,7 +103,7 @@ def test_draft_drops_malformed_posts(brand):
 
     sh.llm_json = fake
     try:
-        posts = _run(sh.draft, brand,
+        posts = _run(sh.write, brand,
                      [{"title": "t", "link": "l", "why_it_fits": "w", "score": 8}])
     finally:
         sh.llm_json = real

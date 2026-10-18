@@ -28,15 +28,11 @@ async def learn_stub(brand):
     return {"summary": None, "reason": "only 2 published posts", "posts": []}
 
 
-@activity.defn(name="analyze")
-async def analyze_stub(brand, items, learn=None):
-    return [{"title": items[0]["title"], "link": items[0]["link"],
-             "why_it_fits": "on-brand", "score": 9}]
-
-
-@activity.defn(name="draft")
-async def draft_stub(brand, picks, learn=None):
-    return [{"text": "Beans cost more. We didn't blink.", "source": picks[0]["link"]}]
+@activity.defn(name="write")
+async def write_stub(brand, items, learn=None):
+    """One merged analyze+draft stub: takes headlines, returns posts."""
+    return [{"text": "Beans cost more. We didn't blink.",
+             "source": items[0]["link"]}]
 
 
 @activity.defn(name="publish")
@@ -44,7 +40,7 @@ async def publish_stub(brand, text):
     return f"posted:{text[:10]}"
 
 
-STUBS = [research_stub, learn_stub, analyze_stub, draft_stub, publish_stub]
+STUBS = [research_stub, learn_stub, write_stub, publish_stub]
 
 
 def _scenario(brand, body, activities=STUBS):
@@ -96,19 +92,19 @@ def test_approve_publishes_only_selected_drafts(brand):
     assert _scenario(brand, body) == ["posted:Beans cost"]
 
 
-def test_learn_result_is_passed_to_analyze_and_draft(brand):
+def test_learn_result_is_passed_to_write(brand):
     """The graceful-learn contract end to end: a null summary plus a reason
-    still flows into the downstream activities without breaking the run."""
+    still flows into the downstream activity without breaking the run."""
     seen = {}
 
-    @activity.defn(name="analyze")
-    async def spy_analyze(brand, items, learn=None):
-        seen["analyze_learn"] = learn
+    @activity.defn(name="write")
+    async def spy_write(brand, items, learn=None):
+        seen["write_learn"] = learn
         await asyncio.sleep(0)
-        return [{"title": items[0]["title"], "link": items[0]["link"],
-                 "why_it_fits": "w", "score": 8}]
+        return [{"text": "Beans cost more. We didn't blink.",
+                 "source": items[0]["link"]}]
 
-    stubs = [research_stub, spy_analyze, draft_stub, publish_stub, learn_stub]
+    stubs = [research_stub, spy_write, publish_stub, learn_stub]
 
     async def body(client):
         h = await client.start_workflow(sh.ContentRun.run, brand,
@@ -117,5 +113,5 @@ def test_learn_result_is_passed_to_analyze_and_draft(brand):
         await h.result()  # no approval -> 48h skip -> []
 
     _scenario(brand, body, activities=stubs)
-    assert seen["analyze_learn"]["summary"] is None
-    assert seen["analyze_learn"]["reason"] == "only 2 published posts"
+    assert seen["write_learn"]["summary"] is None
+    assert seen["write_learn"]["reason"] == "only 2 published posts"

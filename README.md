@@ -9,9 +9,9 @@ Open-source AI is the core: Gemma runs locally via Ollama, so client data
 stays on your box and every post costs $0. No closed APIs.
 
 ```
-research (Google News RSS) -> analyze (Gemma ranks angles)
-  -> draft (Gemma writes in the client's voice) -> HUMAN APPROVAL
-  -> publish (Bluesky; dry-run outbox if no creds)
+research (Google News RSS) -> learn (what worked last week)
+  -> write (Gemma picks angles AND writes posts in one call)
+  -> HUMAN APPROVAL -> publish (Bluesky; dry-run outbox if no creds)
 ```
 
 ## Setup
@@ -40,7 +40,7 @@ python social_hustle.py run clients/brew-lane/brand.json
 ```
 
 Watch progress in the Temporal UI at **http://localhost:8233** — you'll see the
-`research` → `analyze` → `draft` activities light up, then the workflow waits
+`research` → `learn` → `write` activities light up, then the workflow waits
 on your approval signal.
 
 ## Approve and publish
@@ -77,6 +77,15 @@ MODEL=gemma3:1b python social_hustle.py worker
 `gemma3:1b` is ~10× faster and still good enough for picking angles and
 writing short posts. Bump it back up to `gemma3:4b` (or `gemma3:12b`) when
 you want quality over speed.
+
+## Speed notes
+
+Each run makes one LLM call (`write` picks angles and writes the posts in a
+single shot) plus one for `learn`, and the network I/O in `research` and
+`learn` now runs in parallel. On a slow box the LLM call is still the
+bottleneck, so the model swap above is the biggest lever. If a call times out
+or the model returns truncated JSON, the run retries with backoff and repairs
+the response rather than failing — see `LLM_TIMEOUT`.
 
 FastAPI + one static HTML file, no build step, no JS framework.
 
