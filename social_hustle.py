@@ -116,40 +116,66 @@ def _strip_fences(raw):
     return stripped
 
 
-def _parse_with_repair(raw):
-    """Parse the model's JSON, repairing truncation if needed.
+def _repair_truncated_json(text):
+    """Close a JSON value that a truncated model response cut off mid-way.
 
-    gemma3:4b occasionally returns a response cut off mid-string (e.g.
-    'Unterminated string starting at: line 17'). Rather than failing the whole
-    activity, walk back to the last point where the JSON is complete and valid.
+    gemma3:4b sometimes returns a response cut off mid-string, e.g.
+    'Unterminated string starting at: line 17'. Rather than failing the whole
+    activity, scan once tracking string state and the container stack, then
+    append the missing closing quote (if cut mid-string) and the missing ]/}
+    brackets. Trailing commas are dropped first.
     """
+    out, stack, i, n = [], [], 0, len(text)
+    in_string = False
+    while i < n:
+        c = text[i]
+        if in_string:
+            out.append(c)
+            if c == "\\" and i + 1 < n:          # keep escapes intact
+                out.append(text[i + 1]); i += 2; continue
+            if c == '"':
+                in_string = False
+            i += 1; continue
+        if c == '"':
+            in_string = True; out.append(c); i += 1; continue
+        if c in "[{":
+            stack.append(c); out.append(c); i += 1; continue
+        if c in "]}":
+            if stack and ((c == "]" and stack[-1] == "[") or (c == "}" and stack[-1] == "{")):
+                stack.pop()
+            out.append(c); i += 1; continue
+        out.append(c); i += 1
+    s = "".join(out).rstrip()
+    # Drop trailing commas before a closing bracket: {"a":1,} / [1,2,]
+    cleaned, j, m = [], 0, len(s)
+    while j < m:
+        if s[j] == "," and j + 1 < m and s[j + 1] in "]}":
+            j += 1; continue
+        cleaned.append(s[j]); j += 1
+    s = "".join(cleaned).rstrip()
+    if in_string:
+        if s.endswith("\\"):                    # dangling escape -> close it first
+            s += '"'
+        s += '"'                                # close the unterminated string
+    for opener in reversed(stack):              # close open containers, innermost first
+        s += "]" if opener == "[" else "}"
+    return s
+
+
+def _parse_with_repair(raw):
+    """Parse the model's JSON, repairing truncation if needed."""
     text = _strip_fences(raw)
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    # Only candidate cut points can end valid JSON: a closing brace/bracket or
-    # a closing quote. This keeps the O(n) scan cheap instead of re-parsing at
-    # every character.
-    for i in range(len(text), 0, -1):
-        if text[i - 1] not in '}]"':
-            continue
-        cand = text[:i].rstrip()
-        try:
-            log.warning("llm_json: repaired truncated response (kept %d of %d chars)",
-                        i, len(text))
-            return json.loads(cand)
-        except json.JSONDecodeError:
-            continue
-    # Last resort: the response was cut before any closing bracket. Try closing
-    # the last unterminated string and then the open containers.
-    for suffix in ('"}', '"]}', '}}', ']}', '"]', '"}', '"]'):
-        try:
-            log.warning("llm_json: repaired truncated response (appended %r)", suffix)
-            return json.loads(text + suffix)
-        except json.JSONDecodeError:
-            continue
-    raise ValueError("no valid JSON in model response")
+    repaired = _repair_truncated_json(text)
+    try:
+        log.warning("llm_json: repaired truncated response (%d -> %d chars)",
+                    len(text), len(repaired))
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        raise ValueError("no valid JSON in model response")
 
 
 # ---------- activities ----------
