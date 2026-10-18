@@ -514,7 +514,7 @@ async def main():
     if cmd == "worker":
         print(f"Worker up (model={MODEL}). Ctrl+C to stop.")
         await Worker(client, task_queue=QUEUE, workflows=[ContentRun],
-                     activities=[research, learn, analyze, draft, publish]).run()
+                     activities=[research, learn, write, publish]).run()
     elif cmd == "run":
         brand = _load_brand(sys.argv[2])
         wid = f"{_slug(brand)}-{datetime.now():%Y%m%d-%H%M}"
